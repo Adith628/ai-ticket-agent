@@ -1,4 +1,5 @@
 import Ticket from "../../models/ticket.js";
+import User from "../../models/user.js";
 import analyzeTicket from "../../utils/ai.js";
 import { sendMail } from "../../utils/mailer";
 import { inngest } from "../client";
@@ -32,16 +33,54 @@ export const onTicketCreated = inngest.createFunction(
 
       const aiResponse = await analyzeTicket(ticket);
 
-      await step.run("ai-processing", async () => {
+      const relatedSkills = await step.run("ai-processing", async () => {
         let skills = [];
         if (aiResponse) {
           await Ticket.findByIdAndUpdate(ticket._id, {
             priority: ["low", "medium", "high"].includes(aiResponse.priority)
               ? aiResponse.priority
               : "medium",
+            helpfulNotes: aiResponse.helpfulNotes || "",
+            status: "IN_PROGRESS",
+            relatedSkills: Array.isArray(aiResponse.relatedSkills),
+          });
+          skills = aiResponse.relatedSkills || [];
+        }
+        return skills;
+      });
+
+      const moderator = await step.run("assign-moderator", async () => {
+        let user = await User.findOne({
+          roles: "moderator",
+          skills: {
+            $elemMatch: {
+              $regex: relatedSkills.join("|"),
+              $options: "i",
+            },
+          },
+        });
+        if (!user) {
+          user = await User.findOne({ roles: "admin" });
+        }
+        await Ticket.findByIdAndUpdate(ticket._id, {
+          assignedTo: user?._id || null,
+        });
+        return user;
+      });
+
+      await step.run("send-notification-email", async () => {
+        if (moderator) {
+          await sendMail({
+            to: moderator.email,
+            subject: `New Ticket Assigned`,
+            text: `A new ticket titled "${ticket.title}" has been assigned to you. Please review it at your earliest convenience.`,
           });
         }
       });
-    } catch (err) {}
+
+      return { success: true };
+    } catch (err) {
+      console.error("Error in onTicketCreated function:", err);
+    }
   }
 );
